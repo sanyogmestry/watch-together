@@ -1,0 +1,6 @@
+node_modules
+npm-debug.log
+.DS_Store
+tmp
+*.tmp.mp4
+watchtogether-cache
