@@ -1636,6 +1636,9 @@ callWidget.addEventListener('mousedown', dragStart);
 callWidget.addEventListener('touchstart', dragStart, { passive: true });
 
 function dragStart(e) {
+  // Disable dragging on mobile (widget is fixed at bottom-right via CSS)
+  if (window.innerWidth <= 600) return;
+
   // Ignore dragging if they clicked control buttons (Mute, Camera toggle, Start Call)
   if (e.target.closest('.call-ctrl-btn')) return;
 
