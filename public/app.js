@@ -558,8 +558,47 @@ function _showTranscodeProgress(fileId, name, proxyUrl, targetSeekTime = 0, auto
                 progressWrap.remove();
               }
               dismiss.remove();
+              const fallbackBtn = document.getElementById('transcode-error-fallback-btn');
+              if (fallbackBtn) fallbackBtn.remove();
+              // Show source selector overlay again so they can choose local copy
+              sourceSelector.classList.remove('hidden');
             });
             overlay.appendChild(dismiss);
+          }
+
+          // If it is a Google Drive file, offer an iframe fallback
+          if (fileId) {
+            let fallbackBtn = document.getElementById('transcode-error-fallback-btn');
+            if (!fallbackBtn) {
+              fallbackBtn = document.createElement('button');
+              fallbackBtn.id = 'transcode-error-fallback-btn';
+              fallbackBtn.className = 'primary-btn btn-sm';
+              fallbackBtn.style.cssText = 'margin-top:16px;margin-left:8px;width:auto;display:inline-flex;padding:6px 16px;background:linear-gradient(90deg,#7c3aed,#06b6d4);border:none;color:#fff;';
+              fallbackBtn.textContent = 'Use Google Drive Player (No Sync)';
+              fallbackBtn.addEventListener('click', () => {
+                overlay.classList.add('hidden');
+                if (spinner) spinner.style.display = '';
+                if (overlayMsg) overlayMsg.textContent = 'Syncing video playback...';
+                if (progressWrap) {
+                  progressWrap.style.display = '';
+                  progressWrap.remove();
+                }
+                fallbackBtn.remove();
+                const dismissBtn = document.getElementById('transcode-error-dismiss-btn');
+                if (dismissBtn) dismissBtn.remove();
+
+                // Load in iframe
+                video.removeAttribute('src');
+                video.load();
+                video.classList.add('hidden');
+                document.getElementById('custom-controls').classList.add('hidden');
+                
+                iframePlayer.src = `https://drive.google.com/file/d/${fileId}/preview`;
+                iframePlayer.classList.remove('hidden');
+                iframeSyncWarning.classList.remove('hidden');
+              });
+              overlay.appendChild(fallbackBtn);
+            }
           }
         }
         logToConsole(`❌ Transcoding failed: ${data.error}`, 'system');
