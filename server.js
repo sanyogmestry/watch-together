@@ -531,6 +531,11 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('p2p-video-time-update', (data) => {
+    if (!currentRoom) return;
+    socket.to(currentRoom).emit('p2p-video-time-update', data);
+  });
+
   socket.on('webrtc-signal', ({ targetSocketId, signal, senderState }) => {
     if (!currentRoom) return;
     io.to(targetSocketId).emit('webrtc-signal', {
