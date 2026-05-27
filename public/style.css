@@ -1635,3 +1635,85 @@ body {
     transform: translate(-50%, 0);
   }
 }
+
+/* ---------------------------------------------------- */
+/* 8. Mobile Responsiveness Overrides */
+/* ---------------------------------------------------- */
+@media (max-width: 900px) {
+  .app-header {
+    height: auto;
+    flex-direction: column;
+    padding: 12px 1rem;
+    gap: 10px;
+    text-align: center;
+  }
+  .header-room-info {
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+    align-items: center;
+  }
+  .header-actions {
+    width: 100%;
+    justify-content: center;
+  }
+  .lounge-layout {
+    flex-direction: column;
+    height: auto;
+    overflow-y: auto;
+  }
+  body {
+    overflow-y: auto;
+  }
+  .lounge-sidebar {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border-light);
+  }
+  .source-methods {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .source-card {
+    padding: 1.5rem 1rem;
+    margin: 10px;
+  }
+  .webrtc-call-widget {
+    width: 110px;
+    height: 110px;
+    top: 75px;
+    right: 15px;
+  }
+  .local-pip {
+    width: 36px;
+    height: 36px;
+  }
+}
+
+@media (max-width: 600px) {
+  .controls-row {
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
+  }
+  .controls-left, .controls-right {
+    justify-content: space-between;
+    width: 100%;
+    gap: 8px;
+  }
+  #theater-btn {
+    display: none !important;
+  }
+  .sync-status-indicator .sync-text {
+    display: none !important;
+  }
+  .sync-status-indicator {
+    padding: 4px 6px;
+  }
+  .timeline-container {
+    margin-bottom: 4px;
+  }
+  .custom-controls {
+    padding: 1rem 1rem 0.5rem 1rem;
+  }
+}

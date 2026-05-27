@@ -1638,6 +1638,13 @@ function selectPlaylistVideo(file) {
 }
 
 function applyRemoteVideoSelection(videoInfo) {
+  // If the exact same video is already loaded, keep the source selector closed and return
+  const isAlreadyLoaded = currentLoadedVideo && currentLoadedVideo.name === videoInfo.name;
+  if (isAlreadyLoaded) {
+    sourceSelector.classList.add('hidden');
+    return;
+  }
+
   currentPlaylistVideo = videoInfo;
   updatePlaylistUI();
 

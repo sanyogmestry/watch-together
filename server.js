@@ -29,6 +29,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ==========================================
 const FFMPEG_PATH = process.env.FFMPEG_PATH || (os.platform() === 'darwin' ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg');
 const FFPROBE_PATH = process.env.FFPROBE_PATH || (os.platform() === 'darwin' ? '/opt/homebrew/bin/ffprobe' : 'ffprobe');
+const VIDEO_ENCODER = os.platform() === 'darwin' ? 'h264_videotoolbox' : 'libx264';
 const CACHE_DIR = join(os.tmpdir(), 'watchtogether-cache');
 if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -98,7 +99,7 @@ async function startTranscodingJob(fileId, cachedFile, audioTrack = 0) {
       '-map', '0:v:0',
       '-map', `0:a:${audioTrack}?`,
       '-vf', 'scale=-2:720',
-      '-c:v', 'h264_videotoolbox',
+      '-c:v', VIDEO_ENCODER,
       '-b:v', '2500k',
       '-c:a', 'aac',
       '-ac', '2',           // downmix surround to stereo
