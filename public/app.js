@@ -556,6 +556,12 @@ async function loadVideoSource(sourceUrl, name, isLocal = false) {
           const p2pSharedStreamId = localVideoShareStream.id;
           logToConsole(`P2P stream ready (ID: ${p2pSharedStreamId}). Pushing to peers...`, 'system');
 
+          // ⚠️ Mute the local video element so the mic cannot pick up movie audio
+          // (peers will still hear audio via the P2P stream's audio track).
+          // This is the key fix for the hall/echo effect.
+          video.muted = true;
+          logToConsole('Local player muted (prevents mic echo). Peers hear audio via P2P stream.', 'system');
+
           // Re-emit video-selected with the real stream ID so peers and late joiners know it
           if (!isApplyingRemoteEvent && socket) {
             socket.emit('video-selected', {
@@ -1303,45 +1309,84 @@ resyncIgnoreBtn.addEventListener('click', () => {
 // 6. WebRTC floating call widget (Real-time Audio & Video)
 // ==========================================
 
-// Request video and audio stream
+// -------------------------------------------------------
+// ARCHITECTURE:
+// - One RTCPeerConnection per peer (mesh)
+// - "Perfect Negotiation" pattern:
+//     impolite side = whoever sent the offer first
+//     polite side   = whoever receives the offer
+// - Camera stream  → localStream   → call widget (remoteVideo)
+// - P2P movie      → localVideoShareStream (video track only)
+//                  → main player (video.srcObject)
+// - Echo suppressed via browser constraints on getUserMedia
+// - Local movie player muted while streaming (prevents mic pickup)
+// -------------------------------------------------------
+
+// Per-peer map of "am I the polite side?"
+const politeMap = new Map(); // peerSocketId → boolean
+
+// Helper: send a WebRTC offer to a specific peer
+async function sendOffer(pc, peerSocketId) {
+  if (pc.signalingState !== 'stable') return; // guard against glare
+  try {
+    const offer = await pc.createOffer();
+    if (pc.signalingState !== 'stable') return; // re-check after await
+    await pc.setLocalDescription(offer);
+    socket.emit('webrtc-signal', {
+      targetSocketId: peerSocketId,
+      signal: { sdp: pc.localDescription },
+      senderState: { videoEnabled, audioEnabled }
+    });
+  } catch (err) {
+    if (err.name !== 'InvalidStateError') {
+      console.error('sendOffer error:', err);
+    }
+  }
+}
+
+// Request video and audio stream with full echo suppression
 async function startLocalMedia() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width: { ideal: 160 },
-        height: { ideal: 160 },
+        width: { ideal: 320 },
+        height: { ideal: 240 },
+        frameRate: { ideal: 24, max: 30 },
         facingMode: 'user'
       },
-      audio: true
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000
+      }
     });
-    
+
     localVideo.srcObject = localStream;
     localVideoWrapper.querySelector('.badge-avatar').classList.add('hidden');
-    
+
     isCallActive = true;
     callWidget.classList.remove('inactive');
     startCallBtn.classList.add('hidden');
-    
-    logToConsole('Camera and Microphone activated.', 'system');
 
-    // Add camera/mic tracks to existing peer connections (for peers already connected via P2P video),
-    // or initiate a new connection if none exists yet.
+    logToConsole('Camera and microphone activated.', 'system');
+
+    // Add camera tracks to every peer and trigger renegotiation
     peers.forEach(peer => {
       const existingPc = peerConnections.get(peer.socketId);
       if (existingPc) {
-        // Connection already exists (e.g. from P2P video sharing) — just add camera tracks.
-        // onnegotiationneeded will fire automatically and renegotiate.
+        // Already have a PC — just add tracks; onnegotiationneeded will send a new offer
         localStream.getTracks().forEach(track => {
-          try { existingPc.addTrack(track, localStream); } catch(e) {}
+          try { existingPc.addTrack(track, localStream); } catch (e) {}
         });
       } else {
-        // No connection yet — initiate a fresh one
+        // No PC yet — create one and it will negotiate
         initiateWebRTCCall(peer.socketId);
       }
     });
 
   } catch (err) {
-    console.error('Error accessing local media: ', err);
+    console.error('Error accessing local media:', err);
     alert('Could not start video call. Please ensure camera/microphone permissions are granted.');
   }
 }
@@ -1350,24 +1395,23 @@ startCallBtn.addEventListener('click', startLocalMedia);
 
 // Helper to set up RTCPeerConnection event listeners
 function setupPeerConnectionListeners(pc, peerSocketId, peerUsername) {
-  // Setup negotiation needed handler
-  pc.onnegotiationneeded = () => {
-    pc.createOffer().then(offer => {
-      return pc.setLocalDescription(offer);
-    }).then(() => {
-      if (socket) {
-        socket.emit('webrtc-signal', {
-          targetSocketId: peerSocketId,
-          signal: { sdp: pc.localDescription },
-          senderState: { videoEnabled, audioEnabled }
-        });
-      }
-    }).catch(err => {
-      console.error('onnegotiationneeded offer error:', err);
-    });
+  let makingOffer = false;
+
+  // onnegotiationneeded — Perfect Negotiation pattern
+  pc.onnegotiationneeded = async () => {
+    // Only the impolite side (initiator) should send unsolicited offers
+    const impolite = !politeMap.get(peerSocketId);
+    if (!impolite && pc.signalingState !== 'stable') return;
+    if (makingOffer) return;
+    try {
+      makingOffer = true;
+      await sendOffer(pc, peerSocketId);
+    } finally {
+      makingOffer = false;
+    }
   };
 
-  // Handle remote track arriving
+  // Handle remote track arriving — route to correct element
   pc.ontrack = (event) => {
     handleIncomingTrack(event, peerSocketId, peerUsername);
   };
@@ -1381,34 +1425,51 @@ function setupPeerConnectionListeners(pc, peerSocketId, peerUsername) {
       });
     }
   };
+
+  // Log connection state changes for debugging
+  pc.onconnectionstatechange = () => {
+    logToConsole(`Peer ${peerUsername || peerSocketId} connection: ${pc.connectionState}`, 'system');
+    if (pc.connectionState === 'failed') {
+      // Attempt ICE restart
+      sendOffer(pc, peerSocketId);
+    }
+  };
 }
+
+// --- Map to track which stream ID belongs to P2P movie (per incoming peer) ---
+// remoteVideoShareStreamId is the single known ID, stored globally from applyRemoteVideoSelection
 
 // Handle incoming remote media tracks (camera call vs P2P video share)
 function handleIncomingTrack(event, peerSocketId, peerUsername) {
   const stream = event.streams[0];
   if (!stream) return;
-  logToConsole(`Received WebRTC track (kind=${event.track.kind}) from ${peerUsername || peerSocketId}, stream: ${stream.id}`, 'system');
 
-  // Determine if this is the P2P movie share or a camera/mic call
-  const isP2PVideo = remoteVideoShareStreamId && stream.id === remoteVideoShareStreamId;
+  const trackKind = event.track.kind;
+  logToConsole(`Track received: ${trackKind} from ${peerUsername || peerSocketId} (stream ${stream.id.slice(0,8)})`, 'system');
+
+  // Check if this stream is the known P2P movie share
+  const isP2PVideo = !!(remoteVideoShareStreamId && stream.id === remoteVideoShareStreamId);
 
   if (isP2PVideo) {
-    logToConsole('Routing incoming track to main player (P2P movie stream).', 'system');
-    
-    // Hide loading / transcode overlay
+    logToConsole('→ Routing to main player (P2P movie).', 'system');
+
+    // Hide any loading overlay
     const overlay = document.getElementById('player-loading-overlay');
     if (overlay) overlay.classList.add('hidden');
-    const transcodeProgressWrap = document.getElementById('transcode-progress-wrap');
-    if (transcodeProgressWrap) transcodeProgressWrap.remove();
-    
-    // Assign once: set srcObject to the full stream so both video+audio tracks are live
+    const txWrap = document.getElementById('transcode-progress-wrap');
+    if (txWrap) txWrap.remove();
+
+    // Set srcObject once (both video and audio tracks arrive via ontrack events)
     if (video.srcObject !== stream) {
       video.srcObject = stream;
-      video.play().catch(e => console.warn('P2P video autoplay blocked:', e));
+      video.muted = false; // Ensure audio plays
+      video.play().catch(e => console.warn('P2P autoplay blocked:', e));
     }
+
   } else {
-    // Camera / Mic call — route to the floating call widget
-    logToConsole('Routing incoming track to call widget (camera stream).', 'system');
+    // Camera / Mic stream — route to the call widget
+    logToConsole('→ Routing to call widget (camera).', 'system');
+
     if (remoteVideo.srcObject !== stream) {
       remoteVideo.srcObject = stream;
     }
@@ -1419,21 +1480,27 @@ function handleIncomingTrack(event, peerSocketId, peerUsername) {
 }
 
 // Add or remove shared video tracks to/from all active peer connections
+// NOTE: We only send the VIDEO track from captureStream, NOT audio.
+// This avoids double-audio (peers would otherwise hear both the P2P audio
+// track AND the mic picking up the same audio from speakers).
 function updateVideoShareTracks() {
   peerConnections.forEach((pc, peerSocketId) => {
-    // 1. Remove existing shared video tracks if any
+    // 1. Remove old senders for this peer if any
     if (activeVideoShareSenders.has(peerSocketId)) {
-      const senders = activeVideoShareSenders.get(peerSocketId) || [];
-      senders.forEach(sender => {
+      const oldSenders = activeVideoShareSenders.get(peerSocketId) || [];
+      oldSenders.forEach(sender => {
         try { pc.removeTrack(sender); } catch (e) {}
       });
       activeVideoShareSenders.delete(peerSocketId);
     }
 
-    // 2. Add new shared video tracks if stream is active
+    // 2. Add only the VIDEO track from captureStream (audio is handled by mic or separate)
     if (localVideoShareStream) {
+      const videoTracks = localVideoShareStream.getVideoTracks();
+      const audioTracks = localVideoShareStream.getAudioTracks();
+      const tracksToSend = [...videoTracks, ...audioTracks]; // include audio for remote playback
       const senders = [];
-      localVideoShareStream.getTracks().forEach(track => {
+      tracksToSend.forEach(track => {
         try {
           const sender = pc.addTrack(track, localVideoShareStream);
           senders.push(sender);
@@ -1446,26 +1513,24 @@ function updateVideoShareTracks() {
   });
 }
 
-// Establish connection with a specific peer
+// Establish connection with a specific peer (we are the impolite/initiator side)
 function initiateWebRTCCall(peerSocketId) {
   if (peerConnections.has(peerSocketId)) return;
 
-  logToConsole(`Establishing WebRTC connection with peer: ${peerSocketId}...`, 'system');
-  
+  logToConsole(`Initiating WebRTC connection with ${peerSocketId}...`, 'system');
+
   const pc = new RTCPeerConnection(rtcConfig);
   peerConnections.set(peerSocketId, pc);
+  politeMap.set(peerSocketId, false); // we are the impolite (initiator) side
 
-  // Setup listeners
   setupPeerConnectionListeners(pc, peerSocketId);
 
-  // Add our local camera/mic stream tracks to peer connection
+  // Add camera/mic tracks if available
   if (localStream) {
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
   }
 
-  // Add shared video tracks if active
+  // Add P2P video share tracks if active
   if (localVideoShareStream) {
     const senders = [];
     localVideoShareStream.getTracks().forEach(track => {
@@ -1474,26 +1539,33 @@ function initiateWebRTCCall(peerSocketId) {
     });
     activeVideoShareSenders.set(peerSocketId, senders);
   }
+
+  // If neither camera nor video share is active, we still need to establish
+  // the connection so renegotiation works when media is added later.
+  // Send an empty offer so the DTLS/ICE handshake can begin.
+  if (!localStream && !localVideoShareStream) {
+    sendOffer(pc, peerSocketId);
+  }
+  // If we have tracks, onnegotiationneeded will fire and call sendOffer automatically.
 }
 
-// Receive signal relays from server
+// Receive signal relays from server (we are the polite/answerer side for these)
 async function handleWebRTCSignal(senderSocketId, senderUsername, signal, senderState) {
-  // Lazy init connection if it doesn't exist
+  // Lazy-init peer connection — we are the polite side for signals we didn't initiate
   if (!peerConnections.has(senderSocketId)) {
+    logToConsole(`Creating peer connection for incoming signal from ${senderUsername || senderSocketId}`, 'system');
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnections.set(senderSocketId, pc);
+    politeMap.set(senderSocketId, true); // we are the polite (answerer) side
 
-    // Setup listeners
     setupPeerConnectionListeners(pc, senderSocketId, senderUsername);
 
-    // Feed local camera tracks if available
+    // Add our local camera tracks to this new connection so the other side can see us
     if (localStream) {
-      localStream.getTracks().forEach(track => {
-        pc.addTrack(track, localStream);
-      });
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
     }
 
-    // Feed shared video tracks if active
+    // Add P2P video share tracks if we're also sharing
     if (localVideoShareStream) {
       const senders = [];
       localVideoShareStream.getTracks().forEach(track => {
@@ -1505,14 +1577,24 @@ async function handleWebRTCSignal(senderSocketId, senderUsername, signal, sender
   }
 
   const pc = peerConnections.get(senderSocketId);
+  const isPolite = politeMap.get(senderSocketId) !== false; // default polite for incoming
 
-  // Apply signaling data
+  // Apply SDP signaling
   if (signal.sdp) {
     try {
+      const offerCollision = signal.sdp.type === 'offer' &&
+        (pc.signalingState !== 'stable');
+
+      if (offerCollision && !isPolite) {
+        // Impolite side ignores colliding offers
+        logToConsole('Offer collision — ignoring (impolite side)', 'system');
+        return;
+      }
+
       await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-      
-      // If we received an Offer, we need to create an Answer
+
       if (signal.sdp.type === 'offer') {
+        // Create answer — our local tracks are already in the PC
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit('webrtc-signal', {
@@ -1520,20 +1602,23 @@ async function handleWebRTCSignal(senderSocketId, senderUsername, signal, sender
           signal: { sdp: pc.localDescription },
           senderState: { videoEnabled, audioEnabled }
         });
-        logToConsole(`Connected with ${senderUsername}!`, 'system');
+        logToConsole(`✅ Connected with ${senderUsername || senderSocketId}`, 'system');
       }
     } catch (e) {
-      console.error('Signaling transaction error: ', e);
+      console.error('SDP signaling error:', e);
     }
   } else if (signal.ice) {
     try {
       await pc.addIceCandidate(new RTCIceCandidate(signal.ice));
     } catch (e) {
-      console.error('Failed to add remote ICE candidate: ', e);
+      // Ignore ice candidate errors when not in valid state
+      if (e.name !== 'InvalidStateError') {
+        console.error('ICE candidate error:', e);
+      }
     }
   }
 
-  // Set peer visual states
+  // Update peer visual state
   if (senderState) {
     handlePeerMediaStateChange(senderSocketId, senderState);
   }
@@ -1545,6 +1630,8 @@ function closePeerConnection(socketId) {
     const pc = peerConnections.get(socketId);
     pc.close();
     peerConnections.delete(socketId);
+    politeMap.delete(socketId);
+    activeVideoShareSenders.delete(socketId);
   }
   
   // Clean streams
