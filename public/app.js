@@ -463,31 +463,21 @@ async function loadVideoSource(sourceUrl, name, isLocal = false) {
   const shareUrl = isLocal ? '' : (fileId ? `/api/stream-video?id=${fileId}` : sourceUrl);
   currentLoadedVideo = { name, streamUrl: shareUrl, isLocal };
 
-  // Prepare P2P Sharing parameters if it is a local video file
-  let p2pSharedStreamId = null;
-  if (isLocal) {
-    try {
-      if (video.captureStream) {
-        localVideoShareStream = video.captureStream();
-      } else if (video.mozCaptureStream) {
-        localVideoShareStream = video.mozCaptureStream();
-      }
-      if (localVideoShareStream) {
-        p2pSharedStreamId = localVideoShareStream.id;
-        logToConsole(`Captured local video share stream ID: ${p2pSharedStreamId}`, 'system');
-      }
-    } catch (e) {
-      console.warn('captureStream failed:', e);
-    }
-  }
+  // -------------------------------------------------------
+  // P2P capture: wait until the video has actual data before
+  // calling captureStream() so the tracks are truly live.
+  // We emit 'video-selected' now (without stream ID) so the
+  // room sees the selection immediately, then re-emit with the
+  // stream ID once the video is ready.
+  // -------------------------------------------------------
 
-  // Emit video selection to room immediately
+  // Emit video selection to room immediately (no stream ID yet)
   if (!isApplyingRemoteEvent && socket) {
     socket.emit('video-selected', { 
       name, 
       streamUrl: shareUrl,
       isLocal: isLocal,
-      p2pSharedStreamId: p2pSharedStreamId
+      p2pSharedStreamId: null   // will be sent again once stream is ready
     });
   }
 
@@ -544,22 +534,46 @@ async function loadVideoSource(sourceUrl, name, isLocal = false) {
     _showTranscodeProgress(fileId, name, resolvedUrl);
   } else {
     if (isLocal) {
-      // Local file: check native audioTracks (Safari)
-      const onMetadata = () => {
+      // Once the video has loaded metadata, capture the live stream and push it to peers
+      video.addEventListener('loadedmetadata', () => {
+        // Native Safari audio track selector
         if (video.audioTracks && video.audioTracks.length > 1) {
           populateNativeAudioTracks(video.audioTracks);
         }
-      };
-      video.addEventListener('loadedmetadata', onMetadata, { once: true });
+
+        // Capture stream NOW — video is loaded and producing frames
+        try {
+          if (video.captureStream) {
+            localVideoShareStream = video.captureStream();
+          } else if (video.mozCaptureStream) {
+            localVideoShareStream = video.mozCaptureStream();
+          }
+        } catch (e) {
+          console.warn('captureStream failed:', e);
+        }
+
+        if (localVideoShareStream) {
+          const p2pSharedStreamId = localVideoShareStream.id;
+          logToConsole(`P2P stream ready (ID: ${p2pSharedStreamId}). Pushing to peers...`, 'system');
+
+          // Re-emit video-selected with the real stream ID so peers and late joiners know it
+          if (!isApplyingRemoteEvent && socket) {
+            socket.emit('video-selected', {
+              name,
+              streamUrl: shareUrl,
+              isLocal: true,
+              p2pSharedStreamId
+            });
+          }
+
+          // Add stream tracks to all existing peer connections
+          updateVideoShareTracks();
+        }
+      }, { once: true });
     }
 
     // Local file or non-proxy URL — load directly
     _playVideoUrl(resolvedUrl, name);
-
-    // If we captured a local stream, push tracks to all connected WebRTC peers
-    if (isLocal && localVideoShareStream) {
-      updateVideoShareTracks();
-    }
   }
 }
 
@@ -1310,9 +1324,20 @@ async function startLocalMedia() {
     
     logToConsole('Camera and Microphone activated.', 'system');
 
-    // If there are already peers in the room, call them!
+    // Add camera/mic tracks to existing peer connections (for peers already connected via P2P video),
+    // or initiate a new connection if none exists yet.
     peers.forEach(peer => {
-      initiateWebRTCCall(peer.socketId);
+      const existingPc = peerConnections.get(peer.socketId);
+      if (existingPc) {
+        // Connection already exists (e.g. from P2P video sharing) — just add camera tracks.
+        // onnegotiationneeded will fire automatically and renegotiate.
+        localStream.getTracks().forEach(track => {
+          try { existingPc.addTrack(track, localStream); } catch(e) {}
+        });
+      } else {
+        // No connection yet — initiate a fresh one
+        initiateWebRTCCall(peer.socketId);
+      }
     });
 
   } catch (err) {
@@ -1361,27 +1386,34 @@ function setupPeerConnectionListeners(pc, peerSocketId, peerUsername) {
 // Handle incoming remote media tracks (camera call vs P2P video share)
 function handleIncomingTrack(event, peerSocketId, peerUsername) {
   const stream = event.streams[0];
-  logToConsole(`Received WebRTC track from peer ${peerUsername || peerSocketId} for stream: ${stream.id}`, 'system');
+  if (!stream) return;
+  logToConsole(`Received WebRTC track (kind=${event.track.kind}) from ${peerUsername || peerSocketId}, stream: ${stream.id}`, 'system');
 
-  if (remoteVideoShareStreamId && stream.id === remoteVideoShareStreamId) {
-    logToConsole('Playing shared P2P video stream in player...', 'system');
+  // Determine if this is the P2P movie share or a camera/mic call
+  const isP2PVideo = remoteVideoShareStreamId && stream.id === remoteVideoShareStreamId;
+
+  if (isP2PVideo) {
+    logToConsole('Routing incoming track to main player (P2P movie stream).', 'system');
     
-    // Hide loading / transcode overlay if visible
+    // Hide loading / transcode overlay
     const overlay = document.getElementById('player-loading-overlay');
     if (overlay) overlay.classList.add('hidden');
     const transcodeProgressWrap = document.getElementById('transcode-progress-wrap');
     if (transcodeProgressWrap) transcodeProgressWrap.remove();
     
-    // Set video source object and play
-    video.srcObject = stream;
-    video.play().catch(e => console.warn('P2P video play failed:', e));
-  } else {
-    // Camera / Mic stream
-    remoteVideo.srcObject = stream;
-    peerAvatar.classList.add('hidden');
-    if (peerUsername) {
-      peerLabel.textContent = peerUsername;
+    // Assign once: set srcObject to the full stream so both video+audio tracks are live
+    if (video.srcObject !== stream) {
+      video.srcObject = stream;
+      video.play().catch(e => console.warn('P2P video autoplay blocked:', e));
     }
+  } else {
+    // Camera / Mic call — route to the floating call widget
+    logToConsole('Routing incoming track to call widget (camera stream).', 'system');
+    if (remoteVideo.srcObject !== stream) {
+      remoteVideo.srcObject = stream;
+    }
+    peerAvatar.classList.add('hidden');
+    if (peerUsername) peerLabel.textContent = peerUsername;
     callWidget.classList.remove('inactive');
   }
 }
@@ -1881,8 +1913,9 @@ function applyRemoteVideoSelection(videoInfo) {
 
   // If the peer is sharing a local P2P stream, store the stream ID for track demuxing
   if (videoInfo.isLocal && videoInfo.p2pSharedStreamId) {
+    const prevStreamId = remoteVideoShareStreamId;
     remoteVideoShareStreamId = videoInfo.p2pSharedStreamId;
-    logToConsole(`Peer is sharing local video via P2P: "${videoInfo.name}". Waiting for WebRTC stream...`, 'system');
+    logToConsole(`Peer is sharing local video via P2P: "${videoInfo.name}" (stream: ${remoteVideoShareStreamId})`, 'system');
 
     currentPlaylistVideo = videoInfo;
     updatePlaylistUI();
@@ -1890,7 +1923,16 @@ function applyRemoteVideoSelection(videoInfo) {
     // Close source selector (no action needed from receiver)
     sourceSelector.classList.add('hidden');
 
-    // Show a loading overlay while waiting for the WebRTC video stream
+    // If we're already showing this stream (srcObject is set), just update overlay and exit
+    if (video.srcObject && !video.srcObject.active === false) {
+      // Stream already playing — hide overlay and we're done
+      const overlay = document.getElementById('player-loading-overlay');
+      if (overlay) overlay.classList.add('hidden');
+      currentLoadedVideo = { name: videoInfo.name, streamUrl: '', isLocal: false };
+      return;
+    }
+
+    // Otherwise prepare the player to receive the WebRTC stream
     const overlay = document.getElementById('player-loading-overlay');
     const overlayMsg = overlay ? overlay.querySelector('p') : null;
     video.classList.remove('hidden');
@@ -1898,13 +1940,16 @@ function applyRemoteVideoSelection(videoInfo) {
     if (overlay) overlay.classList.remove('hidden');
     if (overlayMsg) overlayMsg.textContent = `Receiving "${videoInfo.name}" from peer...`;
 
-    // Reset video element ready for srcObject
+    // Switch to <video> element (hide iframe)
     iframePlayer.src = '';
     iframePlayer.classList.add('hidden');
     iframeSyncWarning.classList.add('hidden');
-    video.removeAttribute('src');
-    video.srcObject = null;
-    video.load();
+
+    // Only clear srcObject if it was from a different stream (not already our target stream)
+    if (!video.srcObject || (prevStreamId && prevStreamId !== remoteVideoShareStreamId)) {
+      video.removeAttribute('src');
+      video.srcObject = null;
+    }
 
     currentLoadedVideo = { name: videoInfo.name, streamUrl: '', isLocal: false };
     return;
