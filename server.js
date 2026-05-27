@@ -67,7 +67,35 @@ async function resolveGDriveDownloadUrl(fileId) {
 
   console.log(`[proxy] Got uuid=${uuid}`);
   const confirmUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid}`;
-  return { url: confirmUrl, cookies: resp.headers.get('set-cookie') || '' };
+  const cookies = resp.headers.get('set-cookie') || '';
+
+  // Pre-flight check to verify the confirmUrl is a binary stream and not an HTML error page (like Quota Exceeded)
+  const cookieHeader = cookies
+    ? cookies.split(',').map(c => c.split(';')[0].trim()).join('; ')
+    : '';
+
+  const headers = { 'User-Agent': USER_AGENT };
+  if (cookieHeader) headers['Cookie'] = cookieHeader;
+
+  console.log(`[proxy] Pre-flight checking: ${confirmUrl}`);
+  const checkResp = await fetch(confirmUrl, {
+    headers,
+    redirect: 'follow'
+  });
+
+  const checkContentType = checkResp.headers.get('content-type') || '';
+  if (checkContentType.includes('text/html')) {
+    const errorHtml = await checkResp.text();
+    if (errorHtml.includes('Quota exceeded') || errorHtml.includes('Too many users have viewed or downloaded')) {
+      throw new Error('Google Drive download quota exceeded for this file. Please try again later.');
+    }
+    if (errorHtml.includes('Access Denied') || errorHtml.includes('Sign in') || errorHtml.includes('login')) {
+      throw new Error('Google Drive Access Denied. Make sure file sharing is set to "Anyone with link can view".');
+    }
+    throw new Error('Google Drive returned an HTML error page instead of the video stream.');
+  }
+
+  return { url: confirmUrl, cookies };
 }
 
 // Start background transcoding (non-blocking, fire-and-forget)

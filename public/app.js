@@ -472,8 +472,19 @@ function _showTranscodeProgress(fileId, name, proxyUrl, targetSeekTime = 0, auto
   document.getElementById('custom-controls').classList.remove('hidden');
   if (overlay) overlay.classList.remove('hidden');
 
-  // Create or update progress bar inside the overlay
+  // Clean up any stale error state
+  const spinner = overlay ? overlay.querySelector('.loading-spinner') : null;
+  if (spinner) spinner.style.display = '';
+  const dismissBtn = document.getElementById('transcode-error-dismiss-btn');
+  if (dismissBtn) dismissBtn.remove();
   let progressWrap = document.getElementById('transcode-progress-wrap');
+  if (progressWrap) {
+    progressWrap.style.display = '';
+    progressWrap.remove();
+    progressWrap = null;
+  }
+
+  // Create or update progress bar inside the overlay
   if (!progressWrap && overlay) {
     progressWrap = document.createElement('div');
     progressWrap.id = 'transcode-progress-wrap';
@@ -519,8 +530,38 @@ function _showTranscodeProgress(fileId, name, proxyUrl, targetSeekTime = 0, auto
       } else if (data.status === 'error') {
         clearInterval(_transcodePollTimer);
         _transcodePollTimer = null;
-        if (overlay) overlay.classList.add('hidden');
-        if (progressWrap) progressWrap.remove();
+        
+        // Render detailed error screen directly in overlay
+        if (overlay) {
+          if (spinner) spinner.style.display = 'none';
+          if (overlayMsg) {
+            overlayMsg.innerHTML = `
+              <span style="color:#ef4444;font-weight:600;display:block;margin-bottom:8px;font-size:1.1rem;">❌ Transcoding Failed</span>
+              <span style="font-size:0.875rem;color:rgba(255,255,255,0.8);max-width:280px;display:block;margin:0 auto;line-height:1.4;">${data.error}</span>
+            `;
+          }
+          if (progressWrap) progressWrap.style.display = 'none';
+          
+          let dismiss = document.getElementById('transcode-error-dismiss-btn');
+          if (!dismiss) {
+            dismiss = document.createElement('button');
+            dismiss.id = 'transcode-error-dismiss-btn';
+            dismiss.className = 'secondary-btn btn-sm';
+            dismiss.style.cssText = 'margin-top:16px;width:auto;display:inline-flex;padding:6px 16px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.15);';
+            dismiss.textContent = 'Dismiss';
+            dismiss.addEventListener('click', () => {
+              overlay.classList.add('hidden');
+              if (spinner) spinner.style.display = '';
+              if (overlayMsg) overlayMsg.textContent = 'Syncing video playback...';
+              if (progressWrap) {
+                progressWrap.style.display = '';
+                progressWrap.remove();
+              }
+              dismiss.remove();
+            });
+            overlay.appendChild(dismiss);
+          }
+        }
         logToConsole(`❌ Transcoding failed: ${data.error}`, 'system');
 
       } else {
@@ -1638,6 +1679,14 @@ function selectPlaylistVideo(file) {
 }
 
 function applyRemoteVideoSelection(videoInfo) {
+  // If the incoming streamUrl is empty, check if we can retrieve it from the playlist
+  if (!videoInfo.streamUrl && playlist) {
+    const playlistItem = playlist.find(item => item.name === videoInfo.name);
+    if (playlistItem && playlistItem.streamUrl) {
+      videoInfo.streamUrl = playlistItem.streamUrl;
+    }
+  }
+
   // If the exact same video is already loaded, keep the source selector closed and return
   const isAlreadyLoaded = currentLoadedVideo && currentLoadedVideo.name === videoInfo.name;
   if (isAlreadyLoaded) {
@@ -1678,7 +1727,18 @@ function applyRemoteVideoSelection(videoInfo) {
 // Bind click handler for Web Stream button in room selection banner
 playActiveStreamBtn.addEventListener('click', () => {
   if (currentPlaylistVideo) {
-    loadVideoSource(currentPlaylistVideo.streamUrl, currentPlaylistVideo.name, false);
-    logToConsole(`Playing web stream for: ${currentPlaylistVideo.name}`, 'action');
+    let streamUrl = currentPlaylistVideo.streamUrl;
+    if (!streamUrl && playlist) {
+      const match = playlist.find(item => item.name === currentPlaylistVideo.name);
+      if (match && match.streamUrl) {
+        streamUrl = match.streamUrl;
+      }
+    }
+    if (streamUrl) {
+      loadVideoSource(streamUrl, currentPlaylistVideo.name, false);
+      logToConsole(`Playing web stream for: ${currentPlaylistVideo.name}`, 'action');
+    } else {
+      alert('No web stream URL found for this video. Please enter it manually in Method 2.');
+    }
   }
 });
