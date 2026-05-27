@@ -410,7 +410,7 @@ function extractDriveFileId(url) {
 // Active transcoding poll timer
 let _transcodePollTimer = null;
 
-function loadVideoSource(sourceUrl, name, isLocal = false) {
+async function loadVideoSource(sourceUrl, name, isLocal = false) {
   // Clear any previous transcoding poll
   if (_transcodePollTimer) { clearInterval(_transcodePollTimer); _transcodePollTimer = null; }
 
@@ -422,9 +422,6 @@ function loadVideoSource(sourceUrl, name, isLocal = false) {
   // Route Drive URLs through local transcoding proxy if not already done
   let resolvedUrl = sourceUrl;
   const fileId = !isLocal ? extractDriveFileId(sourceUrl) : null;
-  if (!isLocal && fileId) {
-    resolvedUrl = `/api/stream-video?id=${fileId}`;
-  }
 
   // Hide iframe, clear old video
   iframePlayer.src = '';
@@ -434,7 +431,9 @@ function loadVideoSource(sourceUrl, name, isLocal = false) {
   video.load();
 
   sourceSelector.classList.add('hidden');
-  const shareUrl = isLocal ? '' : resolvedUrl;
+  
+  // Set proxy URL format if it's a Drive URL so the local sync works correctly
+  const shareUrl = isLocal ? '' : (fileId ? `/api/stream-video?id=${fileId}` : sourceUrl);
   currentLoadedVideo = { name, streamUrl: shareUrl, isLocal };
 
   // Emit video selection to room immediately
@@ -442,23 +441,68 @@ function loadVideoSource(sourceUrl, name, isLocal = false) {
     socket.emit('video-selected', { name, streamUrl: shareUrl });
   }
 
-  // Fetch audio tracks list if it is a Google Drive web stream
+  // Handle Google Drive stream audio tracks and transcoding
   if (!isLocal && fileId) {
-    fetchAndPopulateAudioTracks(fileId, resolvedUrl, name);
-  } else if (isLocal) {
-    // Local file: check native audioTracks (Safari)
-    const onMetadata = () => {
-      if (video.audioTracks && video.audioTracks.length > 1) {
-        populateNativeAudioTracks(video.audioTracks);
-      }
-    };
-    video.addEventListener('loadedmetadata', onMetadata, { once: true });
-  }
+    // Show a quick pre-probe loading state in overlay
+    const overlay = document.getElementById('player-loading-overlay');
+    const overlayMsg = overlay ? overlay.querySelector('p') : null;
+    video.classList.remove('hidden');
+    document.getElementById('custom-controls').classList.remove('hidden');
+    if (overlay) overlay.classList.remove('hidden');
+    if (overlayMsg) overlayMsg.textContent = `Analyzing audio tracks...`;
 
-  // If it's a proxy URL, poll until transcoding is done before loading
-  if (!isLocal && resolvedUrl.startsWith('/api/stream-video') && fileId) {
+    try {
+      const resp = await fetch(`/api/video-tracks?id=${encodeURIComponent(fileId)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const tracks = data.tracks || [];
+        if (tracks.length > 1) {
+          // Find English track index
+          const engIndex = tracks.findIndex(t => 
+            (t.language && t.language.toLowerCase() === 'eng') ||
+            (t.title && t.title.toLowerCase().includes('english')) ||
+            (t.title && t.title.toLowerCase().includes('eng'))
+          );
+          if (engIndex !== -1) {
+            currentAudioTrack = tracks[engIndex].index;
+            logToConsole(`Defaulting to English audio track (index ${currentAudioTrack})`, 'system');
+          }
+
+          // Populate the audio selection menu
+          audioTrackMenu.innerHTML = '';
+          tracks.forEach(track => {
+            const opt = document.createElement('div');
+            opt.className = 'audio-option';
+            if (track.index === currentAudioTrack) {
+              opt.className += ' active';
+            }
+            opt.textContent = `${track.title || track.language} (${track.language.toUpperCase()})`;
+            opt.addEventListener('click', () => {
+              if (track.index === currentAudioTrack) return;
+              switchAudioTrack(fileId, resolvedUrl, name, track.index);
+            });
+            audioTrackMenu.appendChild(opt);
+          });
+          audioTrackContainer.classList.remove('hidden');
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to pre-fetch audio tracks:', err);
+    }
+
+    resolvedUrl = `/api/stream-video?id=${fileId}&audioTrack=${currentAudioTrack}`;
     _showTranscodeProgress(fileId, name, resolvedUrl);
   } else {
+    if (isLocal) {
+      // Local file: check native audioTracks (Safari)
+      const onMetadata = () => {
+        if (video.audioTracks && video.audioTracks.length > 1) {
+          populateNativeAudioTracks(video.audioTracks);
+        }
+      };
+      video.addEventListener('loadedmetadata', onMetadata, { once: true });
+    }
+
     // Local file or non-proxy URL — load directly
     _playVideoUrl(resolvedUrl, name);
   }
@@ -646,41 +690,6 @@ function _playVideoUrl(url, name, targetSeekTime = 0, autoPlay = false) {
   }
 }
 
-// Fetch tracks from API and render dropdown options
-async function fetchAndPopulateAudioTracks(fileId, baseStreamUrl, name) {
-  audioTrackContainer.classList.add('hidden');
-  audioTrackMenu.innerHTML = '';
-
-  try {
-    const resp = await fetch(`/api/video-tracks?id=${encodeURIComponent(fileId)}`);
-    if (!resp.ok) throw new Error('API failed');
-    const data = await resp.json();
-    const tracks = data.tracks || [];
-
-    if (tracks.length > 1) {
-      // Clear menu
-      audioTrackMenu.innerHTML = '';
-
-      tracks.forEach(track => {
-        const opt = document.createElement('div');
-        opt.className = 'audio-option';
-        if (track.index === currentAudioTrack) {
-          opt.className += ' active';
-        }
-        opt.textContent = `${track.title || track.language} (${track.language.toUpperCase()})`;
-        opt.addEventListener('click', () => {
-          if (track.index === currentAudioTrack) return;
-          switchAudioTrack(fileId, baseStreamUrl, name, track.index);
-        });
-        audioTrackMenu.appendChild(opt);
-      });
-
-      audioTrackContainer.classList.remove('hidden');
-    }
-  } catch (err) {
-    console.warn('Failed to fetch audio tracks metadata:', err);
-  }
-}
 
 // Render dropdown options using Safari's native AudioTrackList API
 function populateNativeAudioTracks(audioTracks) {

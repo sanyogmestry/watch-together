@@ -191,44 +191,39 @@ async function startTranscodingJob(fileId, cachedFile, audioTrack = 0) {
   }
 }
 
-// GET /api/video-tracks?id=FILE_ID
-// Extract and return audio tracks available in the source file
-app.get('/api/video-tracks', async (req, res) => {
-  const fileId = req.query.id;
-  if (!fileId) return res.status(400).json({ error: 'Missing id' });
-
-  // Return cached result if available
+// Helper to extract and return audio tracks available in the source file
+async function getAudioTracks(fileId) {
   if (videoTracksCache.has(fileId)) {
-    return res.json({ tracks: videoTracksCache.get(fileId) });
+    return videoTracksCache.get(fileId);
   }
 
-  try {
-    let downloadUrl = '';
-    let cookies = '';
+  let downloadUrl = '';
+  let cookies = '';
 
-    // Check if it's a Drive ID or a standard direct URL
-    if (fileId.length >= 10 && !fileId.startsWith('http')) {
-      const resolved = await resolveGDriveDownloadUrl(fileId);
-      downloadUrl = resolved.url;
-      cookies = resolved.cookies;
-    } else {
-      downloadUrl = fileId;
-    }
+  // Check if it's a Drive ID or a standard direct URL
+  if (fileId.length >= 10 && !fileId.startsWith('http')) {
+    const resolved = await resolveGDriveDownloadUrl(fileId);
+    downloadUrl = resolved.url;
+    cookies = resolved.cookies;
+  } else {
+    downloadUrl = fileId;
+  }
 
-    const cookieHeader = cookies
-      ? cookies.split(',').map(c => c.split(';')[0].trim()).join('; ')
-      : '';
+  const cookieHeader = cookies
+    ? cookies.split(',').map(c => c.split(';')[0].trim()).join('; ')
+    : '';
 
-    const ffprobeArgs = [
-      '-v', 'error',
-      '-select_streams', 'a',
-      '-show_entries', 'stream=index:stream_tags=language,title',
-      '-of', 'json',
-      '-user_agent', USER_AGENT,
-      ...(cookieHeader ? ['-headers', `Cookie: ${cookieHeader}\r\n`] : []),
-      downloadUrl
-    ];
+  const ffprobeArgs = [
+    '-v', 'error',
+    '-select_streams', 'a',
+    '-show_entries', 'stream=index:stream_tags=language,title',
+    '-of', 'json',
+    '-user_agent', USER_AGENT,
+    ...(cookieHeader ? ['-headers', `Cookie: ${cookieHeader}\r\n`] : []),
+    downloadUrl
+  ];
 
+  return new Promise((resolve, reject) => {
     const fp = spawn(FFPROBE_PATH, ffprobeArgs);
     let stdout = '';
     let stderr = '';
@@ -251,18 +246,30 @@ app.get('/api/video-tracks', async (req, res) => {
             };
           });
           videoTracksCache.set(fileId, tracks);
-          res.json({ tracks });
+          resolve(tracks);
         } catch (e) {
-          res.status(500).json({ error: 'Failed to parse ffprobe output: ' + e.message });
+          reject(new Error('Failed to parse ffprobe output: ' + e.message));
         }
       } else {
-        res.status(500).json({ error: `ffprobe failed with code ${code}: ${stderr}` });
+        reject(new Error(`ffprobe failed with code ${code}: ${stderr}`));
       }
     });
 
     fp.on('error', err => {
-      res.status(500).json({ error: 'ffprobe spawn failed: ' + err.message });
+      reject(new Error('ffprobe spawn failed: ' + err.message));
     });
+  });
+}
+
+// GET /api/video-tracks?id=FILE_ID
+// Extract and return audio tracks available in the source file
+app.get('/api/video-tracks', async (req, res) => {
+  const fileId = req.query.id;
+  if (!fileId) return res.status(400).json({ error: 'Missing id' });
+
+  try {
+    const tracks = await getAudioTracks(fileId);
+    res.json({ tracks });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -290,9 +297,29 @@ app.get('/api/video-status', (req, res) => {
 // If ready → serve with range requests. If not → start transcoding and return 202.
 app.get('/api/stream-video', async (req, res) => {
   const fileId = req.query.id;
-  const audioTrack = parseInt(req.query.audioTrack || '0', 10);
   if (!fileId || fileId.length < 10) {
     return res.status(400).json({ error: 'Missing or invalid Google Drive file ID' });
+  }
+
+  let audioTrack = 0;
+  if (req.query.audioTrack !== undefined) {
+    audioTrack = parseInt(req.query.audioTrack, 10);
+  } else {
+    // If not specified, default to English track if one exists, otherwise track 0
+    try {
+      const tracks = await getAudioTracks(fileId);
+      const engIndex = tracks.findIndex(t => 
+        (t.language && t.language.toLowerCase() === 'eng') ||
+        (t.title && t.title.toLowerCase().includes('english')) ||
+        (t.title && t.title.toLowerCase().includes('eng'))
+      );
+      if (engIndex !== -1) {
+        audioTrack = tracks[engIndex].index;
+        console.log(`[proxy] Auto-detected English audio track at index ${audioTrack} for file ${fileId}`);
+      }
+    } catch (e) {
+      console.warn('[proxy] Failed to auto-detect tracks for stream default:', e.message);
+    }
   }
 
   const cachedFile = join(CACHE_DIR, `${fileId}_at${audioTrack}.mp4`);
