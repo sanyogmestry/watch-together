@@ -9,11 +9,7 @@ let currentPlaylistVideo = null;
 let currentLoadedVideo = null; // { name, streamUrl, isLocal }
 let currentAudioTrack = 0;
 
-// Local Media Stream state
-let localStream = null;
-let videoEnabled = true;
-let audioEnabled = true;
-let isCallActive = false;
+// Video call module removed
 
 // Local P2P Video Sharing State
 let localVideoShareStream = null;
@@ -100,20 +96,7 @@ const roomActiveVideoBanner = document.getElementById('room-active-video-banner'
 const roomActiveVideoName = document.getElementById('room-active-video-name');
 const playActiveStreamBtn = document.getElementById('play-active-stream-btn');
 
-// WebRTC Floating Call Widget Elements
-const callWidget = document.getElementById('webrtc-call-widget');
-const dragHandle = document.getElementById('widget-drag-handle');
-const localVideo = document.getElementById('local-video');
-const remoteVideo = document.getElementById('remote-video');
-const localVideoWrapper = document.getElementById('local-video-wrapper');
-const peerVideoWrapper = document.getElementById('peer-video-wrapper');
-const peerAvatar = document.getElementById('peer-avatar');
-const localAvatar = document.getElementById('local-avatar');
-const peerLabel = document.getElementById('peer-label');
-
-const toggleVideoBtn = document.getElementById('toggle-video-btn');
-const toggleAudioBtn = document.getElementById('toggle-audio-btn');
-const startCallBtn = document.getElementById('start-call-btn');
+// Call widget elements removed
 
 // Ice Servers Configuration (STUN for NAT Traversal)
 const rtcConfig = {
@@ -291,10 +274,6 @@ function initializeLounge() {
     await handleWebRTCSignal(senderSocketId, senderUsername, signal, senderState);
   });
 
-  // WebRTC remote media toggle notify
-  socket.on('peer-media-state-change', ({ socketId, mediaState }) => {
-    handlePeerMediaStateChange(socketId, mediaState);
-  });
 
   // Playlist sync listeners
   socket.on('playlist-update', (updatedPlaylist) => {
@@ -1333,21 +1312,8 @@ resyncIgnoreBtn.addEventListener('click', () => {
 });
 
 // ==========================================
-// 6. WebRTC floating call widget (Real-time Audio & Video)
+// 6. WebRTC P2P Video/Audio Sharing Sync Logic
 // ==========================================
-
-// -------------------------------------------------------
-// ARCHITECTURE:
-// - One RTCPeerConnection per peer (mesh)
-// - "Perfect Negotiation" pattern:
-//     impolite side = whoever sent the offer first
-//     polite side   = whoever receives the offer
-// - Camera stream  → localStream   → call widget (remoteVideo)
-// - P2P movie      → localVideoShareStream (video track only)
-//                  → main player (video.srcObject)
-// - Echo suppressed via browser constraints on getUserMedia
-// - Local movie player muted while streaming (prevents mic pickup)
-// -------------------------------------------------------
 
 // Per-peer map of "am I the polite side?"
 const politeMap = new Map(); // peerSocketId → boolean
@@ -1361,8 +1327,7 @@ async function sendOffer(pc, peerSocketId) {
     await pc.setLocalDescription(offer);
     socket.emit('webrtc-signal', {
       targetSocketId: peerSocketId,
-      signal: { sdp: pc.localDescription },
-      senderState: { videoEnabled, audioEnabled }
+      signal: { sdp: pc.localDescription }
     });
   } catch (err) {
     if (err.name !== 'InvalidStateError') {
@@ -1371,62 +1336,11 @@ async function sendOffer(pc, peerSocketId) {
   }
 }
 
-// Request video and audio stream with full echo suppression
-async function startLocalMedia() {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: 320 },
-        height: { ideal: 240 },
-        frameRate: { ideal: 24, max: 30 },
-        facingMode: 'user'
-      },
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        sampleRate: 48000
-      }
-    });
-
-    localVideo.srcObject = localStream;
-    localVideoWrapper.querySelector('.badge-avatar').classList.add('hidden');
-
-    isCallActive = true;
-    callWidget.classList.remove('inactive');
-    startCallBtn.classList.add('hidden');
-
-    logToConsole('Camera and microphone activated.', 'system');
-
-    // Add camera tracks to every peer and trigger renegotiation
-    peers.forEach(peer => {
-      const existingPc = peerConnections.get(peer.socketId);
-      if (existingPc) {
-        // Already have a PC — just add tracks; onnegotiationneeded will send a new offer
-        localStream.getTracks().forEach(track => {
-          try { existingPc.addTrack(track, localStream); } catch (e) {}
-        });
-      } else {
-        // No PC yet — create one and it will negotiate
-        initiateWebRTCCall(peer.socketId);
-      }
-    });
-
-  } catch (err) {
-    console.error('Error accessing local media:', err);
-    alert('Could not start video call. Please ensure camera/microphone permissions are granted.');
-  }
-}
-
-startCallBtn.addEventListener('click', startLocalMedia);
-
 // Helper to set up RTCPeerConnection event listeners
 function setupPeerConnectionListeners(pc, peerSocketId, peerUsername) {
   let makingOffer = false;
 
-  // onnegotiationneeded — Perfect Negotiation pattern
   pc.onnegotiationneeded = async () => {
-    // Only the impolite side (initiator) should send unsolicited offers
     const impolite = !politeMap.get(peerSocketId);
     if (!impolite && pc.signalingState !== 'stable') return;
     if (makingOffer) return;
@@ -1438,12 +1352,10 @@ function setupPeerConnectionListeners(pc, peerSocketId, peerUsername) {
     }
   };
 
-  // Handle remote track arriving — route to correct element
   pc.ontrack = (event) => {
     handleIncomingTrack(event, peerSocketId, peerUsername);
   };
 
-  // Handle ICE candidates
   pc.onicecandidate = (event) => {
     if (event.candidate && socket) {
       socket.emit('webrtc-signal', {
@@ -1453,20 +1365,15 @@ function setupPeerConnectionListeners(pc, peerSocketId, peerUsername) {
     }
   };
 
-  // Log connection state changes for debugging
   pc.onconnectionstatechange = () => {
     logToConsole(`Peer ${peerUsername || peerSocketId} connection: ${pc.connectionState}`, 'system');
     if (pc.connectionState === 'failed') {
-      // Attempt ICE restart
       sendOffer(pc, peerSocketId);
     }
   };
 }
 
-// --- Map to track which stream ID belongs to P2P movie (per incoming peer) ---
-// remoteVideoShareStreamId is the single known ID, stored globally from applyRemoteVideoSelection
-
-// Handle incoming remote media tracks (camera call vs P2P video share)
+// Handle incoming remote media tracks (P2P video share only)
 function handleIncomingTrack(event, peerSocketId, peerUsername) {
   const stream = event.streams[0];
   if (!stream) return;
@@ -1492,24 +1399,10 @@ function handleIncomingTrack(event, peerSocketId, peerUsername) {
       video.muted = false; // Ensure audio plays
       video.play().catch(e => console.warn('P2P autoplay blocked:', e));
     }
-
-  } else {
-    // Camera / Mic stream — route to the call widget
-    logToConsole('→ Routing to call widget (camera).', 'system');
-
-    if (remoteVideo.srcObject !== stream) {
-      remoteVideo.srcObject = stream;
-    }
-    peerAvatar.classList.add('hidden');
-    if (peerUsername) peerLabel.textContent = peerUsername;
-    callWidget.classList.remove('inactive');
   }
 }
 
 // Add or remove shared video tracks to/from all active peer connections
-// NOTE: We only send the VIDEO track from captureStream, NOT audio.
-// This avoids double-audio (peers would otherwise hear both the P2P audio
-// track AND the mic picking up the same audio from speakers).
 function updateVideoShareTracks() {
   peerConnections.forEach((pc, peerSocketId) => {
     // 1. Remove old senders for this peer if any
@@ -1521,11 +1414,11 @@ function updateVideoShareTracks() {
       activeVideoShareSenders.delete(peerSocketId);
     }
 
-    // 2. Add only the VIDEO track from captureStream (audio is handled by mic or separate)
+    // 2. Add video and audio tracks from captureStream (for remote playback)
     if (localVideoShareStream) {
       const videoTracks = localVideoShareStream.getVideoTracks();
       const audioTracks = localVideoShareStream.getAudioTracks();
-      const tracksToSend = [...videoTracks, ...audioTracks]; // include audio for remote playback
+      const tracksToSend = [...videoTracks, ...audioTracks];
       const senders = [];
       tracksToSend.forEach(track => {
         try {
@@ -1540,7 +1433,7 @@ function updateVideoShareTracks() {
   });
 }
 
-// Establish connection with a specific peer (we are the impolite/initiator side)
+// Establish connection with a specific peer
 function initiateWebRTCCall(peerSocketId) {
   if (peerConnections.has(peerSocketId)) return;
 
@@ -1552,11 +1445,6 @@ function initiateWebRTCCall(peerSocketId) {
 
   setupPeerConnectionListeners(pc, peerSocketId);
 
-  // Add camera/mic tracks if available
-  if (localStream) {
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-  }
-
   // Add P2P video share tracks if active
   if (localVideoShareStream) {
     const senders = [];
@@ -1567,18 +1455,15 @@ function initiateWebRTCCall(peerSocketId) {
     activeVideoShareSenders.set(peerSocketId, senders);
   }
 
-  // If neither camera nor video share is active, we still need to establish
-  // the connection so renegotiation works when media is added later.
-  // Send an empty offer so the DTLS/ICE handshake can begin.
-  if (!localStream && !localVideoShareStream) {
+  // Send an empty offer to establish connection so renegotiation works when tracks are added
+  if (!localVideoShareStream) {
     sendOffer(pc, peerSocketId);
   }
-  // If we have tracks, onnegotiationneeded will fire and call sendOffer automatically.
 }
 
-// Receive signal relays from server (we are the polite/answerer side for these)
-async function handleWebRTCSignal(senderSocketId, senderUsername, signal, senderState) {
-  // Lazy-init peer connection — we are the polite side for signals we didn't initiate
+// Receive signal relays from server
+async function handleWebRTCSignal(senderSocketId, senderUsername, signal) {
+  // Lazy-init peer connection
   if (!peerConnections.has(senderSocketId)) {
     logToConsole(`Creating peer connection for incoming signal from ${senderUsername || senderSocketId}`, 'system');
     const pc = new RTCPeerConnection(rtcConfig);
@@ -1587,12 +1472,7 @@ async function handleWebRTCSignal(senderSocketId, senderUsername, signal, sender
 
     setupPeerConnectionListeners(pc, senderSocketId, senderUsername);
 
-    // Add our local camera tracks to this new connection so the other side can see us
-    if (localStream) {
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-    }
-
-    // Add P2P video share tracks if we're also sharing
+    // Add P2P video share tracks if active
     if (localVideoShareStream) {
       const senders = [];
       localVideoShareStream.getTracks().forEach(track => {
@@ -1604,16 +1484,14 @@ async function handleWebRTCSignal(senderSocketId, senderUsername, signal, sender
   }
 
   const pc = peerConnections.get(senderSocketId);
-  const isPolite = politeMap.get(senderSocketId) !== false; // default polite for incoming
+  const isPolite = politeMap.get(senderSocketId) !== false;
 
   // Apply SDP signaling
   if (signal.sdp) {
     try {
-      const offerCollision = signal.sdp.type === 'offer' &&
-        (pc.signalingState !== 'stable');
+      const offerCollision = signal.sdp.type === 'offer' && (pc.signalingState !== 'stable');
 
       if (offerCollision && !isPolite) {
-        // Impolite side ignores colliding offers
         logToConsole('Offer collision — ignoring (impolite side)', 'system');
         return;
       }
@@ -1621,13 +1499,11 @@ async function handleWebRTCSignal(senderSocketId, senderUsername, signal, sender
       await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
 
       if (signal.sdp.type === 'offer') {
-        // Create answer — our local tracks are already in the PC
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit('webrtc-signal', {
           targetSocketId: senderSocketId,
-          signal: { sdp: pc.localDescription },
-          senderState: { videoEnabled, audioEnabled }
+          signal: { sdp: pc.localDescription }
         });
         logToConsole(`✅ Connected with ${senderUsername || senderSocketId}`, 'system');
       }
@@ -1638,16 +1514,10 @@ async function handleWebRTCSignal(senderSocketId, senderUsername, signal, sender
     try {
       await pc.addIceCandidate(new RTCIceCandidate(signal.ice));
     } catch (e) {
-      // Ignore ice candidate errors when not in valid state
       if (e.name !== 'InvalidStateError') {
         console.error('ICE candidate error:', e);
       }
     }
-  }
-
-  // Update peer visual state
-  if (senderState) {
-    handlePeerMediaStateChange(senderSocketId, senderState);
   }
 }
 
@@ -1660,187 +1530,7 @@ function closePeerConnection(socketId) {
     politeMap.delete(socketId);
     activeVideoShareSenders.delete(socketId);
   }
-  
-  // Clean streams
-  remoteVideo.srcObject = null;
-  peerAvatar.classList.remove('hidden');
-  peerLabel.textContent = 'Friend';
-  
-  if (peerConnections.size === 0) {
-    // If no other calls, show widget inactive
-    callWidget.classList.add('inactive');
-  }
 }
-
-// Toggle Local Video / Voice mute
-toggleVideoBtn.addEventListener('click', () => {
-  if (!localStream) return;
-  
-  videoEnabled = !videoEnabled;
-  localStream.getVideoTracks().forEach(track => {
-    track.enabled = videoEnabled;
-  });
-
-  if (videoEnabled) {
-    toggleVideoBtn.classList.remove('muted');
-    toggleVideoBtn.querySelector('.video-on-icon').classList.remove('hidden');
-    toggleVideoBtn.querySelector('.video-off-icon').classList.add('hidden');
-    localVideoWrapper.querySelector('.badge-avatar').classList.add('hidden');
-  } else {
-    toggleVideoBtn.classList.add('muted');
-    toggleVideoBtn.querySelector('.video-on-icon').classList.add('hidden');
-    toggleVideoBtn.querySelector('.video-off-icon').classList.remove('hidden');
-    localVideoWrapper.querySelector('.badge-avatar').classList.remove('hidden');
-  }
-
-  // Notify server
-  socket.emit('media-state-change', { videoEnabled, audioEnabled });
-});
-
-toggleAudioBtn.addEventListener('click', () => {
-  if (!localStream) return;
-  
-  audioEnabled = !audioEnabled;
-  localStream.getAudioTracks().forEach(track => {
-    track.enabled = audioEnabled;
-  });
-
-  if (audioEnabled) {
-    toggleAudioBtn.classList.remove('muted');
-    toggleAudioBtn.querySelector('.audio-on-icon').classList.remove('hidden');
-    toggleAudioBtn.querySelector('.audio-off-icon').classList.add('hidden');
-    localVideoWrapper.classList.remove('camera-muted');
-  } else {
-    toggleAudioBtn.classList.add('muted');
-    toggleAudioBtn.querySelector('.audio-on-icon').classList.add('hidden');
-    toggleAudioBtn.querySelector('.audio-off-icon').classList.remove('hidden');
-    localVideoWrapper.classList.add('camera-muted');
-  }
-
-  // Notify server
-  socket.emit('media-state-change', { videoEnabled, audioEnabled });
-});
-
-function handlePeerMediaStateChange(socketId, mediaState) {
-  const { videoEnabled: pVideo, audioEnabled: pAudio } = mediaState;
-  
-  if (pVideo) {
-    peerAvatar.classList.add('hidden');
-  } else {
-    peerAvatar.classList.remove('hidden');
-  }
-  
-  // Show glowing neon indicator based on voice activity simulation or just muted states
-  if (pAudio) {
-    callWidget.classList.remove('speaking');
-  } else {
-    // If muted, flash border red or dim
-  }
-}
-
-// ==========================================
-// 7. Draggable Circle Badge Logic (Mouse & Touch)
-// ==========================================
-
-let isDragging = false;
-let startX, startY;
-let initialX, initialY;
-
-callWidget.addEventListener('mousedown', dragStart);
-callWidget.addEventListener('touchstart', dragStart, { passive: true });
-
-function dragStart(e) {
-  // Disable dragging on mobile (widget is fixed at bottom-right via CSS)
-  if (window.innerWidth <= 600) return;
-
-  // Ignore dragging if they clicked control buttons (Mute, Camera toggle, Start Call)
-  if (e.target.closest('.call-ctrl-btn')) return;
-
-  isDragging = true;
-  
-  // Support both mouse and touch coords
-  const clientX = e.type === 'touchstart' ? e.touches[0].clientX : e.clientX;
-  const clientY = e.type === 'touchstart' ? e.touches[0].clientY : e.clientY;
-  
-  startX = clientX;
-  startY = clientY;
-  
-  const rect = callWidget.getBoundingClientRect();
-  initialX = rect.left;
-  initialY = rect.top;
-
-  // Change cursor styling on active drag
-  callWidget.style.transition = 'none';
-
-  if (e.type === 'mousedown') {
-    document.addEventListener('mousemove', dragMove);
-    document.addEventListener('mouseup', dragEnd);
-  } else {
-    document.addEventListener('touchmove', dragMove, { passive: false });
-    document.addEventListener('touchend', dragEnd);
-  }
-}
-
-function dragMove(e) {
-  if (!isDragging) return;
-  if (e.type === 'touchmove') e.preventDefault(); // Prevent standard page scroll during touch-drag
-  
-  const clientX = e.type === 'touchmove' ? e.touches[0].clientX : e.clientX;
-  const clientY = e.type === 'touchmove' ? e.touches[0].clientY : e.clientY;
-  
-  const dx = clientX - startX;
-  const dy = clientY - startY;
-  
-  let newX = initialX + dx;
-  let newY = initialY + dy;
-  
-  // Viewport bounds locking
-  const widgetRect = callWidget.getBoundingClientRect();
-  const maxX = window.innerWidth - widgetRect.width;
-  const maxY = window.innerHeight - widgetRect.height;
-  
-  newX = Math.max(0, Math.min(newX, maxX));
-  newY = Math.max(0, Math.min(newY, maxY));
-  
-  callWidget.style.left = `${newX}px`;
-  callWidget.style.top = `${newY}px`;
-  callWidget.style.right = 'auto'; // Remove standard positioning values
-  callWidget.style.bottom = 'auto';
-}
-
-function dragEnd() {
-  isDragging = false;
-  callWidget.style.transition = 'box-shadow 0.3s ease, border-color 0.3s ease, opacity 0.3s';
-  
-  document.removeEventListener('mousemove', dragMove);
-  document.removeEventListener('mouseup', dragEnd);
-  document.removeEventListener('touchmove', dragMove);
-  document.removeEventListener('touchend', dragEnd);
-}
-
-// Recalculate call widget boundaries on window resize or fullscreen toggle
-function adjustWidgetPositionBounds() {
-  setTimeout(() => {
-    const rect = callWidget.getBoundingClientRect();
-    const maxX = window.innerWidth - rect.width;
-    const maxY = window.innerHeight - rect.height;
-    
-    if (callWidget.style.left) {
-      let currentLeft = parseFloat(callWidget.style.left);
-      let currentTop = parseFloat(callWidget.style.top);
-      
-      let newLeft = Math.max(0, Math.min(currentLeft, maxX));
-      let newTop = Math.max(0, Math.min(currentTop, maxY));
-      
-      callWidget.style.left = `${newLeft}px`;
-      callWidget.style.top = `${newTop}px`;
-    }
-  }, 100);
-}
-
-document.addEventListener('fullscreenchange', adjustWidgetPositionBounds);
-document.addEventListener('webkitfullscreenchange', adjustWidgetPositionBounds);
-window.addEventListener('resize', adjustWidgetPositionBounds);
 
 // ==========================================
 // 8. Console/Activity Logging & Sidebar Details
