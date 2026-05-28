@@ -534,46 +534,10 @@ async function loadVideoSource(sourceUrl, name, isLocal = false) {
     _showTranscodeProgress(fileId, name, resolvedUrl);
   } else {
     if (isLocal) {
-      // Once the video has loaded metadata, capture the live stream and push it to peers
+      // Once the video has loaded metadata, populate native audio track options (Safari)
       video.addEventListener('loadedmetadata', () => {
-        // Native Safari audio track selector
         if (video.audioTracks && video.audioTracks.length > 1) {
           populateNativeAudioTracks(video.audioTracks);
-        }
-
-        // Capture stream NOW — video is loaded and producing frames
-        try {
-          if (video.captureStream) {
-            localVideoShareStream = video.captureStream();
-          } else if (video.mozCaptureStream) {
-            localVideoShareStream = video.mozCaptureStream();
-          }
-        } catch (e) {
-          console.warn('captureStream failed:', e);
-        }
-
-        if (localVideoShareStream) {
-          const p2pSharedStreamId = localVideoShareStream.id;
-          logToConsole(`P2P stream ready (ID: ${p2pSharedStreamId}). Pushing to peers...`, 'system');
-
-          // ⚠️ Mute the local video element so the mic cannot pick up movie audio
-          // (peers will still hear audio via the P2P stream's audio track).
-          // This is the key fix for the hall/echo effect.
-          video.muted = true;
-          logToConsole('Local player muted (prevents mic echo). Peers hear audio via P2P stream.', 'system');
-
-          // Re-emit video-selected with the real stream ID so peers and late joiners know it
-          if (!isApplyingRemoteEvent && socket) {
-            socket.emit('video-selected', {
-              name,
-              streamUrl: shareUrl,
-              isLocal: true,
-              p2pSharedStreamId
-            });
-          }
-
-          // Add stream tracks to all existing peer connections
-          updateVideoShareTracks();
         }
       }, { once: true });
     }
@@ -981,12 +945,31 @@ document.querySelectorAll('.speed-option').forEach(opt => {
 
 // 4.6 Fullscreen & Theater mode
 fullscreenBtn.addEventListener('click', () => {
+  // Detect iOS Safari which doesn't support container fullscreen
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
   if (!document.fullscreenElement) {
-    playerContainer.requestFullscreen().catch(err => {
-      alert(`Error trying to enable full-screen: ${err.message}`);
-    });
+    if (isIOS && video.requestFullscreen) {
+      // iOS Safari now supports requestFullscreen on video
+      video.requestFullscreen().catch(err => alert(`Error entering fullscreen: ${err.message}`));
+    } else if (isIOS && video.webkitEnterFullscreen) {
+      // Fallback for older iOS versions
+      video.webkitEnterFullscreen();
+    } else {
+      // Standard browsers – request fullscreen on player container
+      playerContainer.requestFullscreen().catch(err => alert(`Error trying to enable full-screen: ${err.message}`));
+    }
+    // Apply helper CSS for mobile full‑screen layout
+    video.classList.add('mobile-fullscreen');
   } else {
-    document.exitFullscreen();
+    // Exit fullscreen – works for both container and video APIs
+    if (document.exitFullscreen) {
+      document.exitFullscreen();
+    } else if (document.webkitExitFullscreen) {
+      document.webkitExitFullscreen();
+    } else if (video.webkitExitFullscreen) {
+      video.webkitExitFullscreen();
+    }
+    video.classList.remove('mobile-fullscreen');
   }
 });
 
@@ -1018,11 +1001,55 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
+function ensureLocalVideoShareStream() {
+  if (!currentLoadedVideo || !currentLoadedVideo.isLocal) return;
+  if (localVideoShareStream) return;
+
+  try {
+    if (video.captureStream) {
+      localVideoShareStream = video.captureStream();
+    } else if (video.mozCaptureStream) {
+      localVideoShareStream = video.mozCaptureStream();
+    }
+  } catch (e) {
+    console.warn('captureStream failed:', e);
+  }
+
+  if (localVideoShareStream) {
+    const p2pSharedStreamId = localVideoShareStream.id;
+    logToConsole(`P2P stream ready (ID: ${p2pSharedStreamId}). Pushing to peers...`, 'system');
+
+    // ⚠️ Mute the local video element so the mic cannot pick up movie audio
+    // (peers will still hear audio via the P2P stream's audio track).
+    video.muted = true;
+    updateVolumeUI();
+    logToConsole('Local player muted (prevents mic echo). Peers hear audio via P2P stream.', 'system');
+
+    // Re-emit video-selected with the real stream ID so peers and late joiners know it
+    if (socket) {
+      socket.emit('video-selected', {
+        name: currentLoadedVideo.name,
+        streamUrl: currentLoadedVideo.streamUrl,
+        isLocal: true,
+        p2pSharedStreamId
+      });
+    }
+
+    // Add stream tracks to all existing peer connections
+    updateVideoShareTracks();
+  }
+}
+
 // 4.7 Video Element Event Handlers for Synchronization
 video.addEventListener('play', () => {
   playPauseBtn.querySelector('.play-icon').classList.add('hidden');
   playPauseBtn.querySelector('.pause-icon').classList.remove('hidden');
   showControlsAndResetTimer();
+
+  // Safely initialize captureStream only on play, avoiding decoder context freeze
+  if (currentLoadedVideo && currentLoadedVideo.isLocal) {
+    ensureLocalVideoShareStream();
+  }
   
   if (isApplyingRemoteEvent) return;
   broadcastStateChange('play', video.currentTime);
